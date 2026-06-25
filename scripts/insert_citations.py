@@ -29,6 +29,8 @@ import copy
 import shutil
 import random
 import argparse
+import zipfile
+import io
 from dataclasses import dataclass, field
 from typing import Optional
 from collections import OrderedDict
@@ -367,7 +369,7 @@ def make_ref_field_runs(ref_number, base_rpr=None):
         r.append(copy.deepcopy(base_rpr))
     it = OxmlElement('w:instrText')
     it.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-    it.text = f' REF _Ref{ref_number} \\h '
+    it.text = f' REF _Ref{ref_number} \\n \\h '
     r.append(it)
     runs.append(r)
 
@@ -431,18 +433,33 @@ def ensure_auto_numbering(doc, elements):
     """
     确保参考文献段落使用 Word 自动编号（[1] [2] ... 格式）。
     如已有有效编号定义则直接复用；否则在 numbering_part 中创建新定义。
+    若 numbering_part 不存在，则将编号定义暂存于 doc._pending_numbering，
+    由 _inject_numbering_into_docx 在保存后注入 docx 文件。
     """
+    numbering = None
+
     try:
         num_part = doc.part.numbering_part
+        if num_part is not None:
+            numbering = num_part.element
     except Exception:
-        print("    ⚠️ 无法访问 numbering_part，使用手动 [n] 文本前缀")
-        return None
+        pass
 
-    if num_part is None:
-        print("    ⚠️ numbering_part 不存在，使用手动 [n] 文本前缀")
-        return None
-
-    numbering = num_part.element
+    if numbering is None:
+        # 文档没有编号部件，创建新的编号定义（保存后入 zip）
+        print("    文档无 numbering 部件，创建新定义...")
+        new_id = '99'
+        abstract_num, num_el = _build_numbering_definition(new_id)
+        # 找个临时"容器"存起来，后面 findall 需要
+        numbering = OxmlElement('w:numbering')
+        numbering.append(abstract_num)
+        numbering.append(num_el)
+        # 标记需要注入（保存后通过 ZIP 写入 numbering.xml）
+        if not hasattr(doc, '_pending_numbering'):
+            doc._pending_numbering = (abstract_num, num_el)
+        # 应用 numPr 到段落
+        _apply_numpr_to_elements(elements, new_id)
+        return new_id
 
     # 1. 检查段落是否已有有效 numPr（numId 在 numbering 中有定义）
     existing_numIds = set()
@@ -460,10 +477,9 @@ def ensure_auto_numbering(doc, elements):
         defined_ids.add(num_el.get(W_TAG('numId')))
 
     if existing_numIds and existing_numIds.issubset(defined_ids):
-        # 已有有效编号 — 无需创建
         return list(existing_numIds)[0]
 
-    # 2. 如果段落有 numPr 但编号不存在，清除这些坏的 numPr
+    # 2. 清除坏的 numPr
     for elem in elements:
         pPr = elem.find(W_TAG('pPr'))
         if pPr is not None:
@@ -484,6 +500,25 @@ def ensure_auto_numbering(doc, elements):
     while new_id in all_ids:
         new_id = str(int(new_id) + 1)
 
+    abs_num, num_el = _build_numbering_definition(new_id)
+
+    # 添加抽象编号定义
+    abstractNum = abs_num.find(W_TAG('abstractNum'))
+    if abstractNum is not None:
+        numbering.append(abstractNum)
+    else:
+        # abs_num IS the abstractNum
+        numbering.append(abs_num)
+    numbering.append(num_el)
+
+    _apply_numpr_to_elements(elements, new_id)
+    return new_id
+
+
+def _build_numbering_definition(new_id='99'):
+    """构建编号定义：abstractNum + num 两个元素。
+    返回 (abstractNum, num_el) 供插入 numbering XML。
+    """
     nsid_val = ''.join(random.choice('0123456789ABCDEF') for _ in range(8))
 
     abstractNum = OxmlElement('w:abstractNum')
@@ -524,15 +559,76 @@ def ensure_auto_numbering(doc, elements):
     lvl.append(lvl_pPr)
 
     abstractNum.append(lvl)
-    numbering.append(abstractNum)
 
     num_el = OxmlElement('w:num')
     num_el.set(W_TAG('numId'), new_id)
     aid_ref = OxmlElement('w:abstractNumId')
     aid_ref.set(W_TAG('val'), new_id)
     num_el.append(aid_ref)
-    numbering.append(num_el)
 
+    return abstractNum, num_el
+
+
+def _inject_numbering_into_docx(docx_path, abstract_num, num_el):
+    """将编号定义注入已保存的 .docx 文件（ZIP 级别操作）。
+
+    python-docx 不暴露创建 NumberingPart 的公开 API，
+    此处直接修改 .docx（本质是 ZIP 包）来注入 word/numbering.xml。
+    """
+    numbering_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+        ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        + etree.tostring(abstract_num, encoding='unicode')
+        + etree.tostring(num_el, encoding='unicode')
+        + '</w:numbering>'
+    )
+
+    # 会被我们改写的文件，先从 zip 中跳过，最后统一写入
+    replaced = {'word/numbering.xml', '[Content_Types].xml',
+               'word/_rels/document.xml.rels'}
+
+    tmp_path = docx_path + '.tmp'
+    with zipfile.ZipFile(docx_path, 'r') as zin, \
+         zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            if item.filename in replaced:
+                continue
+            zout.writestr(item, zin.read(item.filename))
+
+        # 写入 numbering.xml
+        zout.writestr('word/numbering.xml', numbering_xml.encode('utf-8'))
+
+        # 更新 [Content_Types].xml
+        ct_xml = zin.read('[Content_Types].xml').decode('utf-8')
+        if 'numbering' not in ct_xml:
+            ct_xml = ct_xml.replace(
+                '</Types>',
+                '<Override PartName="/word/numbering.xml"'
+                ' ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/>'
+                '</Types>'
+            )
+        zout.writestr('[Content_Types].xml', ct_xml.encode('utf-8'))
+
+        # 更新 word/_rels/document.xml.rels
+        rels_xml = zin.read('word/_rels/document.xml.rels').decode('utf-8')
+        if 'numbering' not in rels_xml:
+            rids = re.findall(r'Id="rId(\d+)"', rels_xml)
+            next_rid = max(int(x) for x in rids) + 1 if rids else 100
+            rels_xml = rels_xml.replace(
+                '</Relationships>',
+                '<Relationship Id="rId%d"'
+                ' Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering"'
+                ' Target="numbering.xml"/>'
+                '</Relationships>' % next_rid
+            )
+        zout.writestr('word/_rels/document.xml.rels', rels_xml.encode('utf-8'))
+
+    os.replace(tmp_path, docx_path)
+
+
+def _apply_numpr_to_elements(elements, num_id):
+    """给每个段落元素添加 numPr（自动编号属性）"""
     for elem in elements:
         pPr = elem.find(W_TAG('pPr'))
         if pPr is None:
@@ -541,14 +637,12 @@ def ensure_auto_numbering(doc, elements):
 
         numPr_new = OxmlElement('w:numPr')
         numId_elem = OxmlElement('w:numId')
-        numId_elem.set(W_TAG('val'), new_id)
+        numId_elem.set(W_TAG('val'), num_id)
         numPr_new.append(numId_elem)
         ilvl = OxmlElement('w:ilvl')
         ilvl.set(W_TAG('val'), '0')
         numPr_new.append(ilvl)
         pPr.append(numPr_new)
-
-    return new_id
 
 def reorder_references_v2(doc, ref_entries, mapping):
     """
@@ -882,12 +976,21 @@ def _replace_text_with_field_runs(para_elem, old_text, position, field_runs):
         insert_after.addnext(fr)
         insert_after = fr
 
-    # 插入后段文本
+    # 插入后段文本（剥离上标格式，避免 after 文本变成上标字号）
     if after:
         r = OxmlElement('w:r')
         old_rpr = last_run.find(W_TAG('rPr'))
         if old_rpr is not None:
-            r.append(copy.deepcopy(old_rpr))
+            rpr_copy = copy.deepcopy(old_rpr)
+            # 移除上标相关属性
+            va = rpr_copy.find(W_TAG('vertAlign'))
+            if va is not None:
+                rpr_copy.remove(va)
+            sz = rpr_copy.find(W_TAG('sz'))
+            if sz is not None and sz.get(W_TAG('val')) in ('16', '17', '18', '19', '20'):
+                rpr_copy.remove(sz)
+            if len(rpr_copy) > 0:
+                r.append(rpr_copy)
         t = OxmlElement('w:t')
         t.text = after
         r.append(t)
@@ -1189,6 +1292,14 @@ def process_document(input_path, output_path=None, do_sort=True, sort_only=False
 
     # ── 保存 ──
     doc.save(output_path)
+
+    # 若文档原本无 numbering 部件，保存后将编号定义注入 docx（ZIP 操作）
+    if hasattr(doc, '_pending_numbering'):
+        print("\n📋 注入自动编号定义到 .docx ...")
+        abs_num, num_el = doc._pending_numbering
+        _inject_numbering_into_docx(output_path, abs_num, num_el)
+        print("   ✅ 编号定义已注入")
+
     print(f"\n{'=' * 60}")
     print(f"✅ 已保存：{output_path}")
 
