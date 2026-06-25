@@ -129,7 +129,33 @@ cd insert-citations-skill
 
 ---
 
+## 更新
+
+安装后是一个 git 仓库，symlink 到 `~/.claude/skills/`，更新只需 `git pull`：
+
+```bash
+cd insert-citations-skill
+./update.sh              # 手动更新到最新版
+./update.sh --schedule   # 设置每天自动检查（macOS/Linux cron）
+./update.sh --unschedule # 取消自动检查
+```
+
+---
+
 ## 文件结构
+
+```
+insert-citations-skill/
+├── SKILL.md              # 主 skill 文件（Claude 执行规则）
+├── FORMATS.md            # 引用格式参考（GB/T 7714、IEEE、APA）
+├── README.md             # 本文件
+├── install.sh            # 一键安装
+├── update.sh             # 一键更新 + 自动更新调度
+├── citation-hunting/
+│   └── SKILL.md          # 文献检索子技能
+└── scripts/
+    └── insert_citations.py   # 核心脚本
+```
 
 ```
 insert-citations-skill/
