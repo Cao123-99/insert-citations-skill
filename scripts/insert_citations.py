@@ -10,10 +10,14 @@
   5. 将正文中的 [n] 替换为 REF 域（交叉引用）
 
 用法：
-  python insert_citations.py <docx路径> [--no-sort] [--dry-run]
+  python insert_citations.py <docx路径> [--no-sort] [--sort-only] [--dry-run]
+                          [--ref-style {plain,superscript,both}]
 
-  --no-sort    跳过排序步骤，仅插入交叉引用字段
-  --dry-run    仅分析和报告，不修改文档
+  --no-sort      跳过排序步骤，仅插入交叉引用字段
+  --sort-only    只排序，不插入交叉引用
+  --dry-run      仅分析和报告，不修改文档
+  --ref-style    引用标记样式过滤：plain=仅匹配非上标, superscript=仅匹配上标,
+                 both=匹配所有（默认）
 
 需求：pip install python-docx
 """
@@ -51,6 +55,7 @@ class Citation:
     raw_text: str = ""
     is_field: bool = False
     ref_names: list = field(default_factory=list)
+    is_superscript: bool = False     # True 表示该引用位于上标 run 中
 
 @dataclass
 class RefEntry:
@@ -188,8 +193,59 @@ def expand_number_string(s):
                 pass
     return numbers
 
-def parse_body_citations(doc, body_start, body_end):
-    """从正文段落 + 表格单元格中提取所有引用标记。"""
+def _build_superscript_ranges(para_elem):
+    """
+    构建段落中上标文本的字符位置区间列表。
+
+    遍历段落 XML 中所有文本 run（跳过 REF 域的 fldChar/instrText），
+    检查 rPr 中是否包含 vertAlign="superscript"，记录上标文本的 (start, end) 区间。
+
+    Args:
+        para_elem: <w:p> 段落的 lxml 元素
+
+    Returns:
+        [(start, end), ...] 列表，start 包含，end 不包含。无上标时返回空列表。
+    """
+    ranges = []
+    char_pos = 0
+    for child in para_elem:
+        tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+        if tag != 'r':
+            continue
+        if child.find(W_TAG('fldChar')) is not None:
+            continue
+        if child.find(W_TAG('instrText')) is not None:
+            continue
+
+        t_elem = child.find(W_TAG('t'))
+        if t_elem is None or t_elem.text is None:
+            continue
+
+        rpr = child.find(W_TAG('rPr'))
+        is_super = False
+        if rpr is not None:
+            va = rpr.find(W_TAG('vertAlign'))
+            if va is not None and va.get(W_TAG('val')) == 'superscript':
+                is_super = True
+
+        text_len = len(t_elem.text)
+        if is_super:
+            ranges.append((char_pos, char_pos + text_len))
+        char_pos += text_len
+
+    return ranges
+
+
+def parse_body_citations(doc, body_start, body_end, ref_style='both'):
+    """从正文段落 + 表格单元格中提取所有引用标记。
+
+    Args:
+        doc: Document 对象
+        body_start: 正文起始段落索引
+        body_end: 正文结束段落索引
+        ref_style: 匹配样式 — 'plain' 仅匹配非上标引用, 'superscript' 仅匹配上标引用,
+                   'both' 匹配所有（默认）
+    """
     citations = []
 
     def scan_paragraph(para, pi):
@@ -210,6 +266,17 @@ def parse_body_citations(doc, body_start, body_end):
                 ))
             return
 
+        # 建立上标区间映射（用于样式过滤和格式记录）
+        sup_ranges = _build_superscript_ranges(para_elem)
+
+        def _is_position_superscript(pos):
+            """检查字符位置是否落在上标区间内"""
+            for start, end in sup_ranges:
+                if start <= pos < end:
+                    return True
+            return False
+
+        # 双方括号 [[n]] — 始终匹配，不受 ref_style 影响（格式足够明确）
         for m in re.finditer(r'\[\[([\d\s,\-，\–\—\[\]]+?)\]\]', para_text):
             nums = expand_number_string(m.group(1))
             nums = [n for n in nums if n > 0]
@@ -219,20 +286,33 @@ def parse_body_citations(doc, body_start, body_end):
                     paragraph_index=pi,
                     position_in_text=m.start(),
                     original_numbers=nums,
-                    raw_text=m.group(0)
+                    raw_text=m.group(0),
+                    is_superscript=_is_position_superscript(m.start())
                 ))
 
+        # 单方括号 [n] — 按 ref_style 过滤
         for m in re.finditer(r'(?<!\[)\[([\d\s,\-，\–\—]+)\](?!\])', para_text):
             nums = expand_number_string(m.group(1))
             nums = [n for n in nums if n > 0]
-            if nums:
-                citations.append(Citation(
-                    para_element=para_elem,
-                    paragraph_index=pi,
-                    position_in_text=m.start(),
-                    original_numbers=nums,
-                    raw_text=m.group(0)
-                ))
+            if not nums:
+                continue
+
+            match_is_superscript = _is_position_superscript(m.start())
+
+            # 样式过滤
+            if ref_style == 'plain' and match_is_superscript:
+                continue   # plain 模式跳过上标引用
+            if ref_style == 'superscript' and not match_is_superscript:
+                continue   # superscript 模式跳过非上标引用
+
+            citations.append(Citation(
+                para_element=para_elem,
+                paragraph_index=pi,
+                position_in_text=m.start(),
+                original_numbers=nums,
+                raw_text=m.group(0),
+                is_superscript=match_is_superscript
+            ))
 
     # 1. 扫描正文段落
     for pi in range(body_start, body_end):
@@ -616,8 +696,14 @@ def insert_ref_fields_for_plain_text(doc, citations):
 
         para_elem = c.para_element
 
-        # ★ 从段落正文 run 获取格式（跳过 rPr 含 vertAlign=superscript 的上标 run）
-        base_rpr = _get_body_rpr(para_elem)
+        # 根据引用是否上标选择对应的 rPr，保留原始格式
+        if c.is_superscript:
+            base_rpr = _get_superscript_rpr(para_elem)
+            if base_rpr is None:
+                # 回退：段落中没有上标 rPr，使用正文格式
+                base_rpr = _get_body_rpr(para_elem)
+        else:
+            base_rpr = _get_body_rpr(para_elem)
 
         # REF 域自带 [n] 显示，多引用时用逗号分隔
         nums = sorted(set(c.original_numbers))
@@ -681,6 +767,40 @@ def _get_body_rpr(para_elem):
             break
 
     return best
+
+
+def _get_superscript_rpr(para_elem):
+    """
+    从段落中获取上标 run 的 rPr（含 vertAlign="superscript"）。
+
+    返回第一个上标文本 run 的 rPr 深拷贝，用于创建保持上标格式的 REF 域。
+    若段落中没有上标 run，返回 None。
+
+    Args:
+        para_elem: <w:p> 段落的 lxml 元素
+
+    Returns:
+        rPr 元素的深拷贝，或 None
+    """
+    for child in para_elem:
+        tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+        if tag != 'r':
+            continue
+        if child.find(W_TAG('fldChar')) is not None:
+            continue
+        if child.find(W_TAG('instrText')) is not None:
+            continue
+
+        rpr = child.find(W_TAG('rPr'))
+        if rpr is None:
+            continue
+
+        va = rpr.find(W_TAG('vertAlign'))
+        if va is not None and va.get(W_TAG('val')) == 'superscript':
+            return copy.deepcopy(rpr)
+
+    return None
+
 
 def _replace_text_with_field_runs(para_elem, old_text, position, field_runs):
     """在段落 XML 中定位纯文本引用并替换为 REF 域 runs。
@@ -916,7 +1036,8 @@ def report_analysis(doc, citations, ref_entries, heading_idx):
 # 主流程
 # ═══════════════════════════════════════════════════════════
 
-def process_document(input_path, output_path=None, do_sort=True, sort_only=False, dry_run=False):
+def process_document(input_path, output_path=None, do_sort=True, sort_only=False,
+                     dry_run=False, ref_style='both'):
     """处理文档的主流程。"""
     if output_path is None:
         base, ext = os.path.splitext(input_path)
@@ -996,7 +1117,7 @@ def process_document(input_path, output_path=None, do_sort=True, sort_only=False
             break
 
     body_end = heading_idx
-    citations = parse_body_citations(doc, body_start, body_end)
+    citations = parse_body_citations(doc, body_start, body_end, ref_style=ref_style)
     print(f"   ✅ 找到 {len(citations)} 处引用标记")
 
     report_analysis(doc, citations, ref_entries, heading_idx)
@@ -1053,7 +1174,7 @@ def process_document(input_path, output_path=None, do_sort=True, sort_only=False
     # ── 步骤 6：插入 REF 域 ──
     if not sort_only:
         print("\n📋 步骤 6：将纯文本引用替换为 REF 域")
-        fresh_citations = parse_body_citations(doc, body_start, body_end)
+        fresh_citations = parse_body_citations(doc, body_start, body_end, ref_style=ref_style)
         valid_ref_nums = {e.new_number or e.original_number for e in ref_entries}
         plain_citations = [c for c in fresh_citations
                            if not c.is_field
@@ -1136,6 +1257,10 @@ def main():
     parser.add_argument('--no-sort', action='store_true', help='只插入交叉引用，不排序')
     parser.add_argument('--sort-only', action='store_true', help='只排序，不插入交叉引用')
     parser.add_argument('--dry-run', action='store_true', help='仅分析不修改')
+    parser.add_argument('--ref-style', choices=['plain', 'superscript', 'both'],
+                        default='both',
+                        help='引用标记样式过滤：plain=仅匹配非上标, '
+                             'superscript=仅匹配上标, both=匹配所有（默认）')
 
     args = parser.parse_args()
     if not os.path.exists(args.input):
@@ -1143,7 +1268,8 @@ def main():
         sys.exit(1)
 
     process_document(args.input, args.output, do_sort=not args.no_sort,
-                     sort_only=args.sort_only, dry_run=args.dry_run)
+                     sort_only=args.sort_only, dry_run=args.dry_run,
+                     ref_style=args.ref_style)
 
 if __name__ == '__main__':
     main()

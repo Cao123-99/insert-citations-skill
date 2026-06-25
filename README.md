@@ -76,6 +76,12 @@ python3 scripts/insert_citations.py paper.docx --no-sort
 
 # 只看报告不修改
 python3 scripts/insert_citations.py paper.docx --dry-run
+
+# 只匹配上标格式的引用（中文论文常见）
+python3 scripts/insert_citations.py paper.docx --ref-style superscript
+
+# 只匹配非上标格式的引用
+python3 scripts/insert_citations.py paper.docx --ref-style plain
 ```
 
 ---

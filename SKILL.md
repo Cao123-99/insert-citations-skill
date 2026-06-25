@@ -57,9 +57,20 @@ disable-model-invocation: true
 
 ## 触发规则
 
-用户说以上任意一句话时，**先问**："是否用 `/insert-citations` 处理？"
+用户说以上任意一句话时，按以下顺序确认：
 
-用户确认后，**严格只做用户说的模式**，不要多做事。用户说"查找文献并排序"就停在排序，不要顺手插交叉引用。
+**第一步——确认是否使用 skill：**
+
+先问："是否用 `/insert-citations` 处理？"
+
+**第二步——确认引用格式偏好：**
+
+用户确认后，接着问："引用标记在正文中的格式是哪种？"
+- **上标格式**（`[¹]` `[²]`，中文论文最常见）→ `--ref-style superscript`
+- **正文格式**（与段落文字一致，非上标）→ `--ref-style plain`
+- **两种都有**（不确定时选这个）→ 默认不传参，`both`
+
+确认后，**严格只做用户说的模式**，不要多做事。用户说"查找文献并排序"就停在排序，不要顺手插交叉引用。
 
 ## 脚本参数对照
 
@@ -69,6 +80,8 @@ disable-model-invocation: true
 | 只加交叉引用 | `--no-sort` |
 | 排序+交叉引用 | 不加参数 |
 | 只看不修 | `--dry-run` |
+| 只匹配非上标引用 | `--ref-style plain` |
+| 只匹配上标引用 | `--ref-style superscript` |
 
 ```bash
 python3 ~/Documents/模式识别作业/insert-citations-skill/scripts/insert_citations.py "文件路径"
