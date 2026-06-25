@@ -12,12 +12,14 @@
 用法：
   python insert_citations.py <docx路径> [--no-sort] [--sort-only] [--dry-run]
                           [--ref-style {plain,superscript,both}]
+                          [--strip-markers]
 
-  --no-sort      跳过排序步骤，仅插入交叉引用字段
-  --sort-only    只排序，不插入交叉引用
-  --dry-run      仅分析和报告，不修改文档
-  --ref-style    引用标记样式过滤：plain=仅匹配非上标, superscript=仅匹配上标,
-                 both=匹配所有（默认）
+  --no-sort       跳过排序步骤，仅插入交叉引用字段
+  --sort-only     只排序，不插入交叉引用
+  --dry-run       仅分析和报告，不修改文档
+  --ref-style     引用标记样式过滤：plain=仅匹配非上标, superscript=仅匹配上标,
+                  both=匹配所有（默认）
+  --strip-markers 清除正文中所有引用标记（如 [1] [2] 等），保留其余文本不变
 
 需求：pip install python-docx
 """
@@ -82,6 +84,30 @@ def find_ref_heading(doc):
         if re.search(r'参考文献', clean) or re.match(r'^[Rr]eferences?$', clean):
             return i, para
     return None, None
+
+def _find_body_range(doc, heading_idx):
+    """返回正文段落的起止索引 (body_start, body_end)。
+
+    body_start = 摘要/关键词之后第一个长段落
+    body_end   = 参考文献标题所在段落索引（无标题时为文档末尾）
+    """
+    body_start = 0
+    for i, para in enumerate(doc.paragraphs):
+        clean = re.sub(r'\s+', '', para.text)
+        if clean in ('摘要', 'Abstract') or clean.startswith('摘要') or clean.startswith('Abstract'):
+            body_start = i + 1
+        if clean.startswith('关键词') or clean.startswith('Keywords'):
+            body_start = i + 1
+
+    # 跳到第一个长段落（正文开始）
+    body_end = heading_idx if heading_idx is not None else len(doc.paragraphs)
+    for i in range(body_start, min(body_end, len(doc.paragraphs))):
+        if len(doc.paragraphs[i].text.strip()) > 50:
+            body_start = i
+            break
+
+    return body_start, body_end
+
 
 def has_auto_numbering(para):
     """段落是否使用 Word 自动编号（且不是标题）。"""
@@ -554,7 +580,7 @@ def _build_numbering_definition(new_id='99'):
     lvl_pPr = OxmlElement('w:pPr')
     ind = OxmlElement('w:ind')
     ind.set(W_TAG('left'), '420')
-    ind.set(W_TAG('hanging'), '420')
+    ind.set(W_TAG('hanging'), '0')
     lvl_pPr.append(ind)
     lvl.append(lvl_pPr)
 
@@ -782,6 +808,128 @@ def update_body_display_texts(doc, mapping):
                         break
     return count
 
+
+def _strip_ref_fields_from_elem(para_elem):
+    """从段落 XML 中移除所有已有的 REF 域（fldChar + instrText + result run）。
+
+    移除每个 REF 域的完整 5-run 序列：
+    fldChar(begin) → instrText(REF _Ref...) → fldChar(separate) → result → fldChar(end)
+    """
+    children = list(para_elem)
+    runs_to_remove = set()
+    i = 0
+    while i < len(children):
+        child = children[i]
+        tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+        if tag != 'r':
+            i += 1
+            continue
+
+        fld = child.find(W_TAG('fldChar'))
+        if fld is not None and fld.get(W_TAG('fldCharType')) == 'begin':
+            # 展开 REF 域边界：begin + instrText + separate + result + end
+            ref_run_indices = [i]
+            for j in range(i + 1, min(i + 6, len(children))):
+                nxt = children[j]
+                nxt_tag = nxt.tag.split('}')[-1] if '}' in nxt.tag else nxt.tag
+                if nxt_tag == 'r':
+                    ref_run_indices.append(j)
+                    nxt_fld = nxt.find(W_TAG('fldChar'))
+                    if nxt_fld is not None and nxt_fld.get(W_TAG('fldCharType')) == 'end':
+                        break
+            else:
+                i += 1
+                continue
+
+            # 检查 instrText 是否包含 REF
+            has_ref = False
+            for idx in ref_run_indices:
+                instr = children[idx].find(W_TAG('instrText'))
+                if instr is not None and instr.text and 'REF' in instr.text:
+                    has_ref = True
+                    break
+
+            if has_ref:
+                runs_to_remove.update(ref_run_indices)
+                i = ref_run_indices[-1] + 1
+            else:
+                i += 1
+        else:
+            i += 1
+
+    # 倒序删除，避免索引偏移
+    for idx in sorted(runs_to_remove, reverse=True):
+        para_elem.remove(children[idx])
+
+
+def strip_ref_fields_from_body(doc, body_start, body_end):
+    """清除正文范围内的所有已有 REF 交叉引用域。
+
+    Args:
+        doc: python-docx Document
+        body_start: 正文起始段落索引
+        body_end: 正文结束段落索引
+
+    Returns:
+        清除的 REF 域数量
+    """
+    count = 0
+    for pi in range(body_start, body_end):
+        para = doc.paragraphs[pi]
+        before = para._element.xml.count('fldChar')
+        _strip_ref_fields_from_elem(para._element)
+        after = para._element.xml.count('fldChar')
+        removed = (before - after) // 2  # 每个 REF 域有 begin+end 两个 fldChar
+        count += max(0, removed)
+
+    # 也处理表格单元格
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    before = para._element.xml.count('fldChar')
+                    _strip_ref_fields_from_elem(para._element)
+                    after = para._element.xml.count('fldChar')
+                    removed = (before - after) // 2
+                    count += max(0, removed)
+
+    return count
+
+
+def strip_body_citations(doc, body_start, body_end, ref_style='both'):
+    """清除正文中所有引用标记（[n] / [[n]]），保留其余文本不变。
+
+    解析正文范围内的所有引用标记，按段落分组后倒序移除，
+    避免位置漂移。已有 REF 域不做处理。
+
+    Args:
+        doc: python-docx Document
+        body_start: 正文起始段落索引
+        body_end: 正文结束段落索引
+        ref_style: 匹配样式，默认 'both'（清除所有格式的标记）
+
+    Returns:
+        清除的标记数量
+    """
+    citations = parse_body_citations(doc, body_start, body_end, ref_style=ref_style)
+
+    # 按段落元素分组（使用 id() 因为 lxml 元素不可哈希比较）
+    by_para = {}
+    for c in citations:
+        if c.is_field:
+            continue  # 不处理已有 REF 域
+        key = id(c.para_element)
+        by_para.setdefault(key, []).append(c)
+
+    for para_citations in by_para.values():
+        # 按位置倒序处理，避免前面的修改影响后面的位置
+        para_citations.sort(key=lambda c: c.position_in_text, reverse=True)
+        for c in para_citations:
+            _strip_text_from_elem(c.para_element, c.raw_text, c.position_in_text)
+
+    return len(citations)
+
+
 def insert_ref_fields_for_plain_text(doc, citations):
     """将正文中纯文本的 [n] / [[n]] 引用替换为 REF 域。"""
     for c in reversed(citations):
@@ -894,6 +1042,105 @@ def _get_superscript_rpr(para_elem):
             return copy.deepcopy(rpr)
 
     return None
+
+
+def _strip_text_from_elem(para_elem, old_text, position):
+    """从段落 XML runs 中移除指定位置的文本。
+
+    处理单 run 和跨 run 文本。移除后合并前后文本片段到第一个 run，
+    若合并后文本为空则删除该 run。
+
+    Args:
+        para_elem: <w:p> lxml 元素
+        old_text: 要移除的文本（如 '[3]'）
+        position: old_text 在扁平段落文本中的字符偏移
+    """
+    # 收集所有纯文本 run（跳过 REF 域 run）
+    text_runs = []
+    for child in list(para_elem):
+        tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+        if tag != 'r':
+            continue
+        if child.find(W_TAG('fldChar')) is not None:
+            continue
+        if child.find(W_TAG('instrText')) is not None:
+            continue
+        t_elem = child.find(W_TAG('t'))
+        if t_elem is not None and t_elem.text is not None:
+            text_runs.append(child)
+
+    # 构建扁平文本定位
+    full_text = ''.join(run.find(W_TAG('t')).text for run in text_runs)
+
+    # 模糊回退
+    if position + len(old_text) > len(full_text):
+        idx = full_text.find(old_text, max(0, position - 5))
+        if idx >= 0:
+            position = idx
+        else:
+            return
+
+    # 定位覆盖 old_text 的 run
+    char_pos = 0
+    involved_runs = []
+    for run in text_runs:
+        t = run.find(W_TAG('t'))
+        run_start = char_pos
+        run_end = char_pos + len(t.text)
+        char_pos = run_end
+        if run_end <= position or run_start >= position + len(old_text):
+            continue
+        involved_runs.append(run)
+
+    if not involved_runs:
+        return
+
+    first_run = involved_runs[0]
+    last_run = involved_runs[-1]
+    first_t = first_run.find(W_TAG('t'))
+    last_t = last_run.find(W_TAG('t'))
+
+    # 计算切分点
+    run_offset_first = 0
+    for r in text_runs:
+        if r is first_run:
+            break
+        run_offset_first += len(r.find(W_TAG('t')).text)
+    first_start = position - run_offset_first
+
+    run_offset_last = 0
+    for r in text_runs:
+        if r is last_run:
+            break
+        run_offset_last += len(r.find(W_TAG('t')).text)
+    last_end = position + len(old_text) - run_offset_last
+
+    before = first_t.text[:first_start]
+    after = last_t.text[last_end:]
+
+    # 删除 first 和 last 之间的 run
+    for run in involved_runs[1:-1]:
+        para_elem.remove(run)
+    if len(involved_runs) > 1:
+        para_elem.remove(last_run)
+
+    # 合并前后文本到 first_run
+    first_t.text = before + after
+    if not first_t.text:
+        para_elem.remove(first_run)
+    else:
+        # 如果合并后的 run 带有上标属性，移除之（剩余文本不再是引用标记）
+        rpr = first_run.find(W_TAG('rPr'))
+        if rpr is not None:
+            va = rpr.find(W_TAG('vertAlign'))
+            if va is not None and va.get(W_TAG('val')) == 'superscript':
+                rpr.remove(va)
+                # 同时移除小字号
+                sz = rpr.find(W_TAG('sz'))
+                if sz is not None and sz.get(W_TAG('val')) in ('16', '17', '18', '19', '20'):
+                    rpr.remove(sz)
+                if len(rpr) == 0:
+                    first_run.remove(rpr)
 
 
 def _replace_text_with_field_runs(para_elem, old_text, position, field_runs):
@@ -1140,8 +1387,12 @@ def report_analysis(doc, citations, ref_entries, heading_idx):
 # ═══════════════════════════════════════════════════════════
 
 def process_document(input_path, output_path=None, do_sort=True, sort_only=False,
-                     dry_run=False, ref_style='both'):
-    """处理文档的主流程。"""
+                     dry_run=False, ref_style='both', strip_first=False):
+    """处理文档的主流程。
+
+    strip_first=True 仅在 --strip-markers --sort-only 组合时使用，
+    排序前先清除正文所有引用标记和 REF 域。
+    """
     if output_path is None:
         base, ext = os.path.splitext(input_path)
         output_path = f"{base}_cited{ext}"
@@ -1204,22 +1455,7 @@ def process_document(input_path, output_path=None, do_sort=True, sort_only=False
     # ── 步骤 3：解析引用标记 ──
     print("\n📋 步骤 3：解析正文中的引用标记")
 
-    # 正文范围：摘要/关键词之后，参考文献之前
-    body_start = 0
-    for i, para in enumerate(doc.paragraphs):
-        clean = re.sub(r'\s+', '', para.text)
-        if clean in ('摘要', 'Abstract') or clean.startswith('摘要') or clean.startswith('Abstract'):
-            body_start = i + 1
-        if clean.startswith('关键词') or clean.startswith('Keywords'):
-            body_start = i + 1
-
-    # 跳到第一个长段落（正文开始）
-    for i in range(body_start, min(heading_idx, len(doc.paragraphs))):
-        if len(doc.paragraphs[i].text.strip()) > 50:
-            body_start = i
-            break
-
-    body_end = heading_idx
+    body_start, body_end = _find_body_range(doc, heading_idx)
     citations = parse_body_citations(doc, body_start, body_end, ref_style=ref_style)
     print(f"   ✅ 找到 {len(citations)} 处引用标记")
 
@@ -1237,36 +1473,58 @@ def process_document(input_path, output_path=None, do_sort=True, sort_only=False
 
         if mapping:
             print(f"   重编号映射：{len(mapping)} 条")
-            # 更新正文 REF 域
-            n1 = update_body_ref_targets(doc, mapping)
-            n2 = update_body_display_texts(doc, mapping)
-            print(f"   已更新 {n1} 个 REF 域目标 + {n2} 个显示文本")
 
-            # 更新纯文本引用编号，同时更新 citation 对象
-            for c in reversed(citations):
-                if c.is_field:
-                    continue
-                new_nums = sorted(set(mapping.get(n, n) for n in c.original_numbers))
-                new_text = make_citation_text(new_nums)
-                # 双方括号 [[n]] → 统一转为 [n]（后续步骤 6 会插入 REF 域）
-                if new_text != c.raw_text:
-                    _replace_text_in_elem(c.para_element,
-                                         c.raw_text, new_text, c.position_in_text)
-                    c.raw_text = new_text
-                    c.original_numbers = new_nums
+            # ── strip_first：先清除正文中所有引用标记，再排序 ──
+            if strip_first:
+                plain_stripped = strip_body_citations(doc, body_start, body_end,
+                                                      ref_style='both')
+                ref_stripped = strip_ref_fields_from_body(doc, body_start, body_end)
+                print(f"   已清除 {plain_stripped} 处纯文本引用 + {ref_stripped} 个 REF 域")
 
-            # 重排参考文献段落
+            # 先重排参考文献段落
             sorted_entries, sorted_elements = reorder_references_v2(doc, ref_entries, mapping)
             ref_entries = sorted_entries
+
+            if not strip_first:
+                # 排序后再更新正文引用编号（REF 域 + 纯文本）
+                n1 = update_body_ref_targets(doc, mapping)
+                n2 = update_body_display_texts(doc, mapping)
+                if n1 or n2:
+                    print(f"   已更新 {n1} 个 REF 域目标 + {n2} 个显示文本")
+
+                for c in reversed(citations):
+                    if c.is_field:
+                        continue
+                    new_nums = sorted(set(mapping.get(n, n) for n in c.original_numbers))
+                    new_text = make_citation_text(new_nums)
+                    if new_text != c.raw_text:
+                        _replace_text_in_elem(c.para_element,
+                                             c.raw_text, new_text, c.position_in_text)
+                        c.raw_text = new_text
+                        c.original_numbers = new_nums
             print(f"   ✅ 排序完成")
         else:
             print(f"   ⚠️  无需排序")
             sorted_elements = [doc.paragraphs[e.paragraph_index]._element for e in ref_entries]
     else:
-        # no-sort: 确保 new_number 已设置
+        # --no-sort: 确保自动编号已应用，清除手动 [n] 前缀避免双重前缀
         for e in ref_entries:
             e.new_number = e.original_number
         sorted_elements = [doc.paragraphs[e.paragraph_index]._element for e in ref_entries]
+        ensure_auto_numbering(doc, sorted_elements)
+        for entry, elem in zip(ref_entries, sorted_elements):
+            text_runs = []
+            for run in elem.findall(W_TAG('r')):
+                t = run.find(W_TAG('t'))
+                if t is not None and t.text is not None:
+                    text_runs.append((run, t))
+            if text_runs:
+                full_text = ''.join(t.text for _, t in text_runs)
+                full_text = re.sub(r'^\s*\[\d+\]\s*', '', full_text)
+                for run, t in text_runs:
+                    t.text = ''
+                text_runs[0][1].text = full_text
+        print(f"   ✅ 已为 {len(sorted_elements)} 条参考文献应用自动编号")
 
     # ── 步骤 5：创建书签 ──
     if not sort_only:
@@ -1372,15 +1630,44 @@ def main():
                         default='both',
                         help='引用标记样式过滤：plain=仅匹配非上标, '
                              'superscript=仅匹配上标, both=匹配所有（默认）')
+    parser.add_argument('--strip-markers', action='store_true',
+                        help='清除正文中所有引用标记（如 [1] [2] 等），保留其余文本不变')
 
     args = parser.parse_args()
     if not os.path.exists(args.input):
         print(f"❌ 文件不存在：{args.input}")
         sys.exit(1)
 
+    # ── --strip-markers：清除正文引用标记 ──
+    # 单独使用：清除后退出。与 --sort-only 组合：先清除再排序。
+    if args.strip_markers and not (args.sort_only):
+        doc = Document(args.input)
+        heading_idx, _ = find_ref_heading(doc)
+        body_start, body_end = _find_body_range(doc, heading_idx)
+
+        stripped_plain = strip_body_citations(doc, body_start, body_end,
+                                              ref_style=args.ref_style)
+        stripped_ref = strip_ref_fields_from_body(doc, body_start, body_end)
+        total = stripped_plain + stripped_ref
+
+        if total == 0:
+            print("未找到任何引用标记或 REF 域，无需清除")
+            return
+
+        output_path = args.output
+        if output_path is None:
+            base, ext = os.path.splitext(args.input)
+            output_path = f"{base}_stripped{ext}"
+
+        doc.save(output_path)
+        print(f"✅ 已清除 {stripped_plain} 处纯文本引用 + {stripped_ref} 个 REF 域")
+        print(f"   输出：{output_path}")
+        return
+
     process_document(args.input, args.output, do_sort=not args.no_sort,
                      sort_only=args.sort_only, dry_run=args.dry_run,
-                     ref_style=args.ref_style)
+                     ref_style=args.ref_style,
+                     strip_first=(args.strip_markers and args.sort_only))
 
 if __name__ == '__main__':
     main()
